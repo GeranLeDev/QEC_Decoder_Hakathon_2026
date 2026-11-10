@@ -1,0 +1,36 @@
+[project]
+name = "hackathon_2026"
+version = "0.1.0"
+description = "Code for the 2026 QEC hackathon"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "JuliusRye", email = "juliusrye@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "ipykernel>=7.3.0",
+    "numpy>=1.24",
+    "stim>=1.13",
+]
+
+[project.optional-dependencies]
+tutorials = [
+    "beliefmatching>=0.2.0",
+    "iminuit>=2.32.0",
+    "jax>=0.4.30",
+    "matplotlib>=3.10.9",
+    "numpy>=2.2.6",
+    "pymatching>=2.3.1",
+    "qecsim>=1.0b9",
+    "stim>=1.15.0",
+    "tqdm>=4.67.3",
+]
+
+[project.scripts]
+check-problem-set = "hackathon_2026.check_problem_set:main"
+
+[build-system]
+requires = ["uv_build>=0.12.8,<0.13.0"]
+build-backend = "uv_build"
