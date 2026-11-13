@@ -351,7 +351,7 @@ def beam_one(s0, s1, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, pow_look
 
 
 @njit(parallel=True, cache=True)
-def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, look, cap_mult, n_threads):
+def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, look, cap_mult, n_threads, flip_eps):
     """Decode all shots (parallel over shots). Returns predictions (shots, 4) and the
     work done per shot (diagnostic only)."""
     shots, nD = dets.shape
@@ -427,6 +427,8 @@ def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, look, 
                     if (c >> k) & 1:
                         p1 += P[c]
                 out[s, k] = 1 if p1 > 0.5 * tot else 0
+                if abs(p1 / tot - 0.5) < flip_eps:     # coin-toss bit: take the other side (see FLIP_EPS)
+                    out[s, k] = 1 - out[s, k]
                 mm = min(mm, abs(p1 / tot - 0.5))
             marg[s] = mm
     return out, work, marg
@@ -451,6 +453,12 @@ TIERS = [
     (2000, 1e-10, 1e-9, 3e-7, 1e-7, 0.0),     # heaviest pass, ~3.5% of the shots (last tier: NEXT unused)
 ]
 
+# Twin of the v6 decoder for the second final submission.  When the probability of a flip is
+# within FLIP_EPS of 0.5 the decision is a coin toss: both answers are (almost) equally likely
+# to be right.  This twin takes the OTHER side on exactly those bits (last tier only), so the
+# two submissions are right on different coin tosses and the better of the two counts.
+FLIP_EPS = 0.01
+
 _cache = {}
 
 
@@ -469,7 +477,8 @@ def decode(circuit: stim.Circuit, detector_events: np.ndarray) -> np.ndarray:
         if len(idx) == 0:
             break
         sub = dets if len(idx) == len(dets) else np.ascontiguousarray(dets[idx])
-        o, _, marg = decode_batch(sub, *prep, K, thr1, thr2, child, keep, LOOK, CAP_MULT, n_threads)
+        o, _, marg = decode_batch(sub, *prep, K, thr1, thr2, child, keep, LOOK, CAP_MULT, n_threads,
+                                  FLIP_EPS if nxt == 0.0 else 0.0)
         out[idx] = o
         idx = idx[marg < nxt]
     return out
@@ -478,7 +487,7 @@ def decode(circuit: stim.Circuit, detector_events: np.ndarray) -> np.ndarray:
 def _warmup():
     c = stim.Circuit.generated("repetition_code:memory", rounds=2, distance=3,
                                before_round_data_depolarization=0.01)
-    decode_batch(np.ones((2, c.num_detectors), np.uint8), *prepare(c), 8, 1e-9, 1e-8, 3e-6, 1e-6, LOOK, CAP_MULT, 2)
+    decode_batch(np.ones((2, c.num_detectors), np.uint8), *prepare(c), 8, 1e-9, 1e-8, 3e-6, 1e-6, LOOK, CAP_MULT, 2, 0.0)
 
 
 _warmup()
