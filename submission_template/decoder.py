@@ -26,7 +26,7 @@ Fully deterministic.
 """
 import numpy as np
 import stim
-from numba import njit, prange, types
+from numba import get_num_threads, njit, prange, types
 from numba.extending import intrinsic
 
 LBIT = 8  # logical bits live in bits 8..11 of the second key word (detectors 64..69 in bits 0..5)
@@ -342,7 +342,7 @@ def beam_one(s0, s1, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, pow_look
 
 
 @njit(parallel=True, cache=True)
-def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, look, cap_mult):
+def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, look, cap_mult, n_threads):
     """Decode all shots (parallel over shots). Returns predictions (shots, 4) and the
     work done per shot (diagnostic only)."""
     shots, nD = dets.shape
@@ -378,9 +378,9 @@ def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, look, 
     for s in range(shots):
         order[start[fired[s]]] = s
         start[fired[s]] += 1
-    # 1920 = 48 x 40 is a multiple of the usual thread counts (2, 4, 8, 10, 12, 16, 24, 32,
-    # 48, 64, 96...), so every thread receives the same number of chunks.
-    n_chunks = min(shots, 1920)         # each chunk owns its work arrays
+    # One chunk per thread: chunk ch takes the shots number ch, ch + n_chunks, ... of the sorted
+    # list, so every THREAD gets the same mix of easy and hard shots.
+    n_chunks = min(shots, n_threads)    # each chunk owns its work arrays
     for ch in prange(n_chunks):
         # np.empty costs nothing until the memory is really used: only the beginning of
         # these (generously sized) arrays is ever touched.
@@ -438,13 +438,14 @@ def decode(circuit: stim.Circuit, detector_events: np.ndarray) -> np.ndarray:
     if key not in _cache:
         _cache[key] = prepare(circuit)
     dets = np.ascontiguousarray(detector_events, dtype=np.uint8)
-    return decode_batch(dets, *_cache[key], K_BEAM, THR1, THR2, CHILD, KEEP, LOOK, CAP_MULT)[0]
+    n_threads = get_num_threads()        # read here: decode_batch stays cacheable
+    return decode_batch(dets, *_cache[key], K_BEAM, THR1, THR2, CHILD, KEEP, LOOK, CAP_MULT, n_threads)[0]
 
 
 def _warmup():
     c = stim.Circuit.generated("repetition_code:memory", rounds=2, distance=3,
                                before_round_data_depolarization=0.01)
-    decode_batch(np.ones((2, c.num_detectors), np.uint8), *prepare(c), 8, THR1, THR2, CHILD, KEEP, LOOK, CAP_MULT)
+    decode_batch(np.ones((2, c.num_detectors), np.uint8), *prepare(c), 8, THR1, THR2, CHILD, KEEP, LOOK, CAP_MULT, 2)
 
 
 _warmup()
