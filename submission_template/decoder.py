@@ -35,7 +35,7 @@ Fully deterministic.
 """
 import numpy as np
 import stim
-from numba import njit, prange, types
+from numba import get_num_threads, njit, prange, types
 from numba.extending import intrinsic
 
 LBIT = 8  # logical bits live in bits 8..11 of the second key word (detectors 64..69 in bits 0..5)
@@ -351,7 +351,7 @@ def beam_one(s0, s1, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, pow_look
 
 
 @njit(parallel=True, cache=True)
-def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, look, cap_mult):
+def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, look, cap_mult, n_threads):
     """Decode all shots (parallel over shots). Returns predictions (shots, 4) and the
     work done per shot (diagnostic only)."""
     shots, nD = dets.shape
@@ -388,9 +388,11 @@ def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, look, 
     for s in range(shots):
         order[start[fired[s]]] = s
         start[fired[s]] += 1
-    # 1920 = 48 x 40 is a multiple of the usual thread counts (2, 4, 8, 10, 12, 16, 24, 32,
-    # 48, 64, 96...), so every thread receives the same number of chunks.
-    n_chunks = min(shots, 1920)         # each chunk owns its work arrays
+    # One chunk per thread: chunk ch takes the shots number ch, ch + n_chunks, ... of the sorted
+    # list, so every THREAD gets the same mix of easy and hard shots, even when a tier of the
+    # cascade only has a few thousand shots (with many more chunks than that, each thread
+    # would receive a contiguous slice of the sorted list and the last ones all the hard shots).
+    n_chunks = min(shots, n_threads)    # each chunk owns its work arrays
     for ch in prange(n_chunks):
         # np.empty costs nothing until the memory is really used: only the beginning of
         # these (generously sized) arrays is ever touched.
@@ -462,11 +464,12 @@ def decode(circuit: stim.Circuit, detector_events: np.ndarray) -> np.ndarray:
     dets = np.ascontiguousarray(detector_events, dtype=np.uint8)
     out = np.zeros((len(dets), 4), np.uint8)
     idx = np.arange(len(dets))           # shots handled by the current tier
+    n_threads = get_num_threads()        # read here: decode_batch stays cacheable
     for K, thr1, thr2, child, keep, nxt in TIERS:
         if len(idx) == 0:
             break
         sub = dets if len(idx) == len(dets) else np.ascontiguousarray(dets[idx])
-        o, _, marg = decode_batch(sub, *prep, K, thr1, thr2, child, keep, LOOK, CAP_MULT)
+        o, _, marg = decode_batch(sub, *prep, K, thr1, thr2, child, keep, LOOK, CAP_MULT, n_threads)
         out[idx] = o
         idx = idx[marg < nxt]
     return out
@@ -475,7 +478,7 @@ def decode(circuit: stim.Circuit, detector_events: np.ndarray) -> np.ndarray:
 def _warmup():
     c = stim.Circuit.generated("repetition_code:memory", rounds=2, distance=3,
                                before_round_data_depolarization=0.01)
-    decode_batch(np.ones((2, c.num_detectors), np.uint8), *prepare(c), 8, 1e-9, 1e-8, 3e-6, 1e-6, LOOK, CAP_MULT)
+    decode_batch(np.ones((2, c.num_detectors), np.uint8), *prepare(c), 8, 1e-9, 1e-8, 3e-6, 1e-6, LOOK, CAP_MULT, 2)
 
 
 _warmup()
