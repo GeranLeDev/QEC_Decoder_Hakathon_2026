@@ -121,14 +121,58 @@ detector_events, observable_flips = test_dataset(circuit, shots=100_000)
 ```
 
 ## Evaluation
-
-The decoder takes the detector events $D$ and predicts the observable flips $\hat O$. The logical error rate (LER), the fraction of wrong predictions, is
-
-$$\text{LER} = \frac{1}{N_\text{trials}}\sum_{i=1}^{N_\text{trials}}\frac{1}{k}\sum_{j=1}^k\left[O_j^{(i)}\neq\hat O_j^{(i)}\right]$$
-
-where $N_\text{trials}$ is the number of shots, $k=4$ is the number of logical qubits, and $[\cdot]$ is 1 if the statement inside is true and 0 otherwise. Every logical qubit of every shot counts separately: a shot where 2 of the 4 predictions are wrong counts as half a failure.
-
+ 
+The decoder takes the detector events \\(D\\) and predicts the observable flips \\(\hat O\\). The logical error rate (LER), the fraction of wrong predictions, is
+ 
+$$\text{LER} = \frac{1}{N\_\text{trials}}\sum\_{i=1}^{N\_\text{trials}}\frac{1}{k}\sum\_{j=1}^k\left[O\_j^{(i)}\neq\hat O\_j^{(i)}\right]$$
+ 
+where \\(N\_\text{trials}\\) is the number of shots, \\(k=4\\) is the number of logical qubits, and \\([\cdot]\\) is 1 if the statement inside is true and 0 otherwise. Every logical qubit of every shot counts separately: a shot where 2 of the 4 predictions are wrong counts as half a failure.
+ 
 On the leaderboard, submissions are scored with the mean absolute error (MAE) between your predictions and the true flips, over every shot and observable. With 0/1 predictions this is exactly the LER. **Lower is better.** X and Z shots count equally. Predicting all zeros already gives an LER of about 0.29.
+ 
+### Submission file
+ 
+For every `id` in `test.csv`, predict the four observable flips `L0` to `L3`, each 0 or 1. The file needs a header row and the columns `id, L0, L1, L2, L3` **in exactly that order**, like `sample_submission.csv`. The metric matches columns by position, not by name.
+ 
+```
+id,L0,L1,L2,L3
+gen_X_00000,0,0,0,0
+gen_X_00001,0,0,0,0
+...
+```
+ 
+**NOTE THAT THERE WAS A TYPO IN THE FIRST VERSION OF THE TEST SUBMISSION FILE, IT SHOULD BE FORMATTED AS ABOVE! AN UPDATED VERSION HAS BEEN UPLOADED ON THE DATA TAB**
+ 
+## Final ranking: accuracy and speed
+ 
+A good decoder must also be fast, so the final ranking is decided in three steps.
+ 
+**Step 1: accuracy.** The leaderboard ranks every submission by its LER. When the competition closes, the top 10 teams on the Private leaderboard go through to step 2. All other teams keep their Private leaderboard order.
+ 
+**Step 2: accuracy and speed.** The top 10 teams hand in their decoder (see the Rules). We run it on our timing machine, one NVIDIA B200 GPU with 48 CPU cores and the same for every team (see the Rules), and measure its runtime \\(t\\): the total wall-clock time to decode all test shots, X and Z, taking the median of 5 runs. You don't need such a machine yourself: a decoder written for a laptop, even one that uses a single CPU core, is fine. The timing machine is the most your decoder can use, not what it must use. Only the two decode calls are timed: importing your decoder, and anything it builds or loads when it is imported, happens before the clock starts. These teams are then ranked by
+ 
+$$\text{final score} = \text{LER} \times \max\left(1, \frac{t}{t\_\text{cap}}\right)^{\alpha}$$
+ 
+where LER is the team's Private leaderboard score. Lower is better.
+ 
+The target runtime \\(t\_\text{cap}\\) is the runtime of our own reference decoder (BP+OSD) on all test shots with 32 CPU threads: **15.4 s**. We time your decoder with 48 threads, so a decoder that parallelises well can gain from the extra cores. A decoder that finishes within \\(t\_\text{cap}\\) keeps its full value: its final score is just its LER. Beyond the cap, the decoder keeps only a share \\((t\_\text{cap}/t)^{\alpha}\\) of its value, so every doubling of the runtime multiplies its final score by \\(2^{\alpha}\\). We use \\(\alpha = 0.2\\), so each doubling costs about 15%:
+ 
+ 
+![Share of its value a decoder keeps against its runtime, for alpha = 0.2: full value up to t_cap, 87% at twice t_cap, 63% at ten times t_cap, and 55% at the 5-minute hard limit](figures/final_score_penalty.png)
+ 
+| Runtime | Score multiplier | Value kept |
+| --- | --- | --- |
+| up to \\(t\_\text{cap}\\) | ×1.00 | 100% |
+| \\(2\,t\_\text{cap}\\) | ×1.15 | 87% |
+| \\(10\,t\_\text{cap}\\) | ×1.58 | 63% |
+| 5 minutes (\\(19.5\,t\_\text{cap}\\)), the hard limit | ×1.81 | 55% |
+ 
+Accuracy and runtime go hand in hand in the final score. A decoder whose LER is 5% lower than another's can run up to 1.3 × \\(t\_\text{cap}\\) before the less accurate decoder under the cap beats it; with a 10% lower LER it can run up to 1.7 × \\(t\_\text{cap}\\), and with a 20% lower LER up to 3.1 × \\(t\_\text{cap}\\).
+ 
+- **Hard limit:** decoders that take longer than \\(t\_\text{max}\\) = 5 minutes are not ranked.
+- **Ties** in the final score are broken by the shorter runtime.
+ 
+**Step 3: presentations.** The top 3 teams in the final score each submit a 5-minute video explaining their solution, by email by 16 November at 07:00 CET. Judges from Riverlane and NVIDIA pick the winning team from these videos, and it wins the prize. See the Rules for the full timeline.
 
 ### Submission file
 
