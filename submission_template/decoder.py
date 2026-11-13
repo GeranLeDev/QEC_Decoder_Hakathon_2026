@@ -1,13 +1,4 @@
-"""Beam maximum-likelihood decoder with a confidence cascade (numpy + numba only, written from scratch).
-
-CASCADE (see decode() at the bottom): every shot is first decoded with a cheap beam.  The
-decoder knows how sure it is: for each observable it has the probability p of a flip, and
-the margin of a shot is min over the 4 observables of |p - 0.5|.  Only the shots whose
-margin is small (the decision could change with a more exact computation) are decoded
-again with a wider beam and looser pruning, and the least certain of those once more with
-the heaviest settings.  The beam itself is described below.
-
-Beam maximum-likelihood decoder (one pass):
+"""Beam maximum-likelihood decoder, fast version (numpy + numba only, written from scratch).
 
 We want, for the observed syndrome, the total probability of every logical class
 (16 values of the 4 observables), summed over ALL error sets that explain the syndrome.
@@ -357,7 +348,6 @@ def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, look, 
     shots, nD = dets.shape
     out = np.zeros((shots, 4), np.uint8)
     work = np.zeros(shots, np.int64)
-    marg = np.full(shots, 0.5)
     cap = K * cap_mult + 256            # max number of states created for one detector
     tsize = 1                           # max hash-table size (power of two >= 2 x cap)
     while tsize < 2 * cap:
@@ -389,9 +379,7 @@ def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, look, 
         order[start[fired[s]]] = s
         start[fired[s]] += 1
     # One chunk per thread: chunk ch takes the shots number ch, ch + n_chunks, ... of the sorted
-    # list, so every THREAD gets the same mix of easy and hard shots, even when a tier of the
-    # cascade only has a few thousand shots (with many more chunks than that, each thread
-    # would receive a contiguous slice of the sorted list and the last ones all the hard shots).
+    # list, so every THREAD gets the same mix of easy and hard shots.
     n_chunks = min(shots, n_threads)    # each chunk owns its work arrays
     for ch in prange(n_chunks):
         # np.empty costs nothing until the memory is really used: only the beginning of
@@ -420,36 +408,25 @@ def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, look, 
             tot = 0.0
             for c in range(16):
                 tot += P[c]
-            mm = 0.5
             for k in range(4):
                 p1 = 0.0
                 for c in range(16):
                     if (c >> k) & 1:
                         p1 += P[c]
                 out[s, k] = 1 if p1 > 0.5 * tot else 0
-                mm = min(mm, abs(p1 / tot - 0.5))
-            marg[s] = mm
-    return out, work, marg
+    return out, work
 
 
 # ----------------------------------------------------------------------------------------
 # Public entry point
 # ----------------------------------------------------------------------------------------
+K_BEAM = 1000      # at most this many states kept after each detector
+THR1 = 1e-9       # stop scanning a group when parent score x odds < THR1 x best score
+THR2 = 1e-8       # same with the product of the odds of two mechanisms of the group
+CHILD = 3e-6      # a child scoring below CHILD x (best score) is not created
+KEEP = 1e-6        # states scoring below KEEP x (best score) are dropped
 LOOK = 0.15        # look-ahead penalty per unexplained syndrome bit
-CAP_MULT = 256     # work-table size = K x CAP_MULT
-
-# One line per tier: (K, THR1, THR2, CHILD, KEEP, NEXT)
-#   K      at most this many states kept after each detector
-#   THR1   stop scanning a group when parent score x odds < THR1 x best score
-#   THR2   same with the product of the odds of two mechanisms of the group
-#   CHILD  a child scoring below CHILD x (best score) is not created
-#   KEEP   states scoring below KEEP x (best score) are dropped
-#   NEXT   shots whose margin is below NEXT are decoded again by the next tier
-TIERS = [
-    (200, 1e-7, 1e-6, 3e-5, 1e-5, 0.45),      # cheap pass, every shot
-    (1000, 1e-9, 1e-8, 3e-6, 1e-6, 0.1),      # the previous single-pass settings, ~17% of the shots
-    (2000, 1e-10, 1e-9, 3e-7, 1e-7, 0.0),     # heaviest pass, ~3.5% of the shots (last tier: NEXT unused)
-]
+CAP_MULT = 256    # work-table size = K_BEAM x CAP_MULT
 
 _cache = {}
 
@@ -460,25 +437,15 @@ def decode(circuit: stim.Circuit, detector_events: np.ndarray) -> np.ndarray:
     key = str(circuit)
     if key not in _cache:
         _cache[key] = prepare(circuit)
-    prep = _cache[key]
     dets = np.ascontiguousarray(detector_events, dtype=np.uint8)
-    out = np.zeros((len(dets), 4), np.uint8)
-    idx = np.arange(len(dets))           # shots handled by the current tier
     n_threads = get_num_threads()        # read here: decode_batch stays cacheable
-    for K, thr1, thr2, child, keep, nxt in TIERS:
-        if len(idx) == 0:
-            break
-        sub = dets if len(idx) == len(dets) else np.ascontiguousarray(dets[idx])
-        o, _, marg = decode_batch(sub, *prep, K, thr1, thr2, child, keep, LOOK, CAP_MULT, n_threads)
-        out[idx] = o
-        idx = idx[marg < nxt]
-    return out
+    return decode_batch(dets, *_cache[key], K_BEAM, THR1, THR2, CHILD, KEEP, LOOK, CAP_MULT, n_threads)[0]
 
 
 def _warmup():
     c = stim.Circuit.generated("repetition_code:memory", rounds=2, distance=3,
                                before_round_data_depolarization=0.01)
-    decode_batch(np.ones((2, c.num_detectors), np.uint8), *prepare(c), 8, 1e-9, 1e-8, 3e-6, 1e-6, LOOK, CAP_MULT, 2)
+    decode_batch(np.ones((2, c.num_detectors), np.uint8), *prepare(c), 8, THR1, THR2, CHILD, KEEP, LOOK, CAP_MULT, 2)
 
 
 _warmup()

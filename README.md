@@ -1,3 +1,30 @@
+# Team FRode: hand-in for the QEC decoder hackathon (November 2026)
+
+**Kaggle team name: FRode**
+
+The code behind our selected submission is in [`submission_template/`](submission_template/):
+
+| | |
+| --- | --- |
+| Kaggle submission (selected final, best private score) | `submission_v5fast.csv`, ref 58322175 (public 0.03370, private 0.03446) |
+| Decoder | [`submission_template/decoder.py`](submission_template/decoder.py): beam maximum-likelihood decoder, written from scratch with numpy + numba (stim only to read the circuit's detector error model) |
+| Requirements | [`submission_template/requirements.txt`](submission_template/requirements.txt): numpy 2.2.6, stim 1.16.0, numba 0.68.1 |
+| Determinism | no randomness; identical predictions on macOS arm64 and Linux x86_64, with 3, 10 or 48 threads |
+| Predictions | [`submissions/submission_v5fast.csv`](submissions/submission_v5fast.csv) is the exact file submitted to Kaggle, produced by this `decoder.py` |
+
+Reproduce from the repository root:
+
+```bash
+python submission_template/run_local.py --problem-set data/train --threads 48                              # labelled check: LER 0.03389
+python submission_template/run_local.py --problem-set data/test --threads 48 --out submission_v5fast.csv  # same file as submissions/submission_v5fast.csv
+```
+
+Our other selected final was `submission_v6fast.csv` (ref 58321833, private 0.03450), produced by the code at tag [`v6-fast-final`](../../tree/v6-fast-final); the predictions file is [`submissions/submission_v6fast.csv`](submissions/submission_v6fast.csv). The code at tag [`v5-fast-final`](../../tree/v5-fast-final) is the same as `submission_template/` here.
+
+---
+
+*Below: the organisers' original README.*
+
 # QEC decoder hackathon, November 2026: build your own decoder
 
 This repository holds the tools for the QEC decoder hackathon. The competition itself runs on Kaggle (invite only); the link to the competition will be added here later. On Kaggle you download the data, submit predictions and follow the leaderboard. Where this README and the Kaggle pages differ, the Kaggle pages count.
