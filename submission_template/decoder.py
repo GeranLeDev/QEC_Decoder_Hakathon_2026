@@ -35,7 +35,8 @@ Fully deterministic.
 """
 import numpy as np
 import stim
-from numba import njit, prange
+from numba import njit, prange, types
+from numba.extending import intrinsic
 
 LBIT = 8  # logical bits live in bits 8..11 of the second key word (detectors 64..69 in bits 0..5)
 
@@ -99,12 +100,18 @@ def prepare(circuit: stim.Circuit):
     return k0[order], k1[order], odds[order].copy(), grp_ptr
 
 
+@intrinsic
+def _ctpop(typingctx, x):
+    """Number of set bits of a 64-bit integer, as one processor instruction (LLVM ctpop)."""
+    def codegen(context, builder, signature, args):
+        fn = builder.module.declare_intrinsic("llvm.ctpop", [args[0].type])
+        return builder.call(fn, [args[0]])
+    return types.uint64(types.uint64), codegen
+
+
 @njit(cache=True, inline='always')
 def _popcount(x):
-    x = x - ((x >> np.uint64(1)) & np.uint64(0x5555555555555555))
-    x = (x & np.uint64(0x3333333333333333)) + ((x >> np.uint64(2)) & np.uint64(0x3333333333333333))
-    x = (x + (x >> np.uint64(4))) & np.uint64(0x0F0F0F0F0F0F0F0F)
-    return np.int64((x * np.uint64(0x0101010101010101)) >> np.uint64(56))
+    return np.int64(_ctpop(x))
 
 
 # ----------------------------------------------------------------------------------------
