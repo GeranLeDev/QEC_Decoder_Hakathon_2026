@@ -35,7 +35,10 @@ def build_problem(circuit: stim.Circuit):
     for inst in dem.flattened():
         if inst.type != "error":
             continue
-        prob = inst.args_copy()[0]
+        # Round to 12 significant digits: stim derives these probabilities with library
+        # functions (powers, roots) whose last bit may differ between machines.  After
+        # rounding, every machine starts from exactly the same numbers.
+        prob = float(f"{inst.args_copy()[0]:.12g}")
         dets, obs = set(), set()
         for t in inst.targets_copy():
             if t.is_relative_detector_id():
@@ -320,9 +323,12 @@ def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, keep, look, cap_mul
     tsize = 1                           # max hash-table size (power of two >= 2 x cap)
     while tsize < 2 * cap:
         tsize *= 2
+    # look ** i by repeated multiplication (not the library power function), so that the
+    # result is bit-identical on every machine.
     pow_look = np.empty(80)
-    for i in range(80):
-        pow_look[i] = look ** i
+    pow_look[0] = 1.0
+    for i in range(1, 80):
+        pow_look[i] = pow_look[i - 1] * look
     max_group = _max_group(grp_ptr)
     # Share the work evenly between the threads.  The cost of a shot grows with the number
     # of detectors that fired, so the shots are sorted by that number (counting sort) and
