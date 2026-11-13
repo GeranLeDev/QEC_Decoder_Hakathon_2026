@@ -1,0 +1,12 @@
+{
+    "out": "data/test/",
+    "shots": 100000,
+    "seed": null,
+    "rounds": 5,
+    "noise_probability": 0.002,
+    "basis": [
+        "X",
+        "Z"
+    ],
+    "exclude_observable_flips": true
+}

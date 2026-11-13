@@ -1,7 +1,7 @@
 [project]
 name = "hackathon_2026"
 version = "0.1.0"
-description = "Code for the 2026 QEC hackathon"
+description = "Stim circuits for the [[18,4,4]] qLDPC code, for the 2026 QEC hackathon"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -27,9 +27,6 @@ tutorials = [
     "stim>=1.15.0",
     "tqdm>=4.67.3",
 ]
-
-[project.scripts]
-check-problem-set = "hackathon_2026.check_problem_set:main"
 
 [build-system]
 requires = ["uv_build>=0.12.8,<0.13.0"]

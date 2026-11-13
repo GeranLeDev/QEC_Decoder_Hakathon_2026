@@ -8,4 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
-data/problem_set/*observable_flips*
+
+# Kaggle upload package, rebuilt by data/make_kaggle_package.py (host_only/ holds the hidden labels)
+data/kaggle_competition/

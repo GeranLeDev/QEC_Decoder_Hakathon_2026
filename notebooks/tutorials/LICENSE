@@ -1,0 +1,16 @@
+Copyright (c) 2026 University of Copenhagen
+
+The tutorial material in this directory (notebooks, Markdown files, images and
+helper_functions.py) is licensed under the Creative Commons Attribution 4.0
+International License (CC BY 4.0).
+
+You are free to share and adapt this material for any purpose, provided you
+give appropriate credit, link to the license, and indicate if changes were
+made.
+
+Summary: https://creativecommons.org/licenses/by/4.0/
+Full legal code: https://creativecommons.org/licenses/by/4.0/legalcode
+
+Suggested attribution:
+  "Large Scale Simulation of Quantum Systems" course material,
+  University of Copenhagen, licensed under CC BY 4.0.

@@ -1,0 +1,7 @@
+DETECTOR(0, 4, 0) rec[-25] rec[-18] rec[-16] rec[-15] rec[-9] rec[-8] rec[-3]
+DETECTOR(0, 2, 0) rec[-24] rec[-18] rec[-17] rec[-14] rec[-8] rec[-7] rec[-2]
+DETECTOR(0, 0, 0) rec[-23] rec[-17] rec[-16] rec[-13] rec[-9] rec[-7] rec[-1]
+DETECTOR(4, 0, 0) rec[-22] rec[-14] rec[-13] rec[-10] rec[-7] rec[-6] rec[-4]
+DETECTOR(2, 4, 0) rec[-21] rec[-18] rec[-12] rec[-10] rec[-6] rec[-3] rec[-2]
+DETECTOR(2, 2, 0) rec[-20] rec[-17] rec[-12] rec[-11] rec[-5] rec[-2] rec[-1]
+DETECTOR(2, 0, 0) rec[-19] rec[-16] rec[-11] rec[-10] rec[-4] rec[-3] rec[-1]

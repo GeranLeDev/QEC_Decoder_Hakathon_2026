@@ -1,0 +1,5 @@
+# Every package your decoder uses, with the exact version. For example:
+numpy==2.2.6
+stim==1.16.0
+# numba==0.68.1
+# torch==...
