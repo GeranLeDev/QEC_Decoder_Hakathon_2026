@@ -386,7 +386,7 @@ def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, keep, look, cap_mul
 # ----------------------------------------------------------------------------------------
 K_BEAM = 300      # at most this many states kept after each detector
 THR1 = 1e-8       # one-mechanism children lighter than THR1 x (heaviest state) are not created
-THR2 = 1e-6       # same for children made by two mechanisms of the same group
+THR2 = 3e-7       # same for children made by two mechanisms of the same group
 KEEP = 1e-5        # states scoring below KEEP x (best score) are dropped
 LOOK = 0.1        # look-ahead penalty per unexplained syndrome bit
 CAP_MULT = 256    # work-table size = K_BEAM x CAP_MULT
