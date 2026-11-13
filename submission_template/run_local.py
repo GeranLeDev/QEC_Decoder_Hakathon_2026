@@ -24,7 +24,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 parser = argparse.ArgumentParser(description="Decode a local problem set with decoder.decode, time it and report the LER.")
-parser.add_argument("--problem-set", default="data/test_set", help="problem set folder (default: data/test_set)")
+parser.add_argument("--problem-set", default="data/train", help="problem set folder (default: data/test_set)")
 parser.add_argument("--decoder", default=HERE, help="folder with your decoder.py (default: this folder)")
 parser.add_argument("--runs", type=int, default=5, help="timed runs; the median is reported (default: 5)")
 parser.add_argument("--threads", type=int, default=None, help="set OMP_NUM_THREADS and NUMBA_NUM_THREADS (we use 48)")
