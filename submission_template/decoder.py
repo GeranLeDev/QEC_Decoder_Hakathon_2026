@@ -68,249 +68,453 @@ def pack_columns(M):
     return out
 
 
+def gf2_rank(M):
+    """Rank of a 0/1 matrix over GF(2) (plain Gaussian elimination, done once per circuit)."""
+    A = (np.array(M, dtype=np.uint8) & 1).copy()
+    rank = 0
+    for c in range(A.shape[1]):
+        if rank == A.shape[0]:
+            break
+        hits = np.nonzero(A[rank:, c])[0]
+        if len(hits) == 0:
+            continue
+        p = rank + hits[0]
+        if p != rank:
+            A[[rank, p]] = A[[p, rank]]
+        rows = np.nonzero(A[:, c])[0]
+        rows = rows[rows != rank]
+        A[rows] ^= A[rank]
+        rank += 1
+    return rank
+
+
 # ----------------------------------------------------------------------------------------
-# 2. Belief propagation (normalised min-sum)
+# 2. Belief propagation (normalised min-sum), W shots at a time
 # ----------------------------------------------------------------------------------------
+# BP does the same sequence of operations for every shot (only the numbers differ), so we
+# run W shots side by side: every message is a row of W numbers ("lanes"), and the inner
+# loops over the lanes compile to SIMD instructions.  Each lane performs exactly the same
+# floating-point operations in the same order as a one-shot BP, so the result does not
+# depend on W nor on which shots share a group.
+
+W = 8   # shots processed together (8 doubles = one AVX-512 register)
 
 
 @njit(cache=True)
-def bp_min_sum(syn, chk_ptr, chk_var, var_ptr, var_edge, prior_llr, max_iter, alpha, llr_out):
-    """Min-sum BP on one syndrome. Edges are listed check by check (chk_var[e] = variable
-    of edge e). Writes the posterior LLR to llr_out; returns True if the hard decision
-    satisfies the syndrome."""
+def bp_min_sum_lanes(synS, chk_ptr, chk_var, var_ptr, var_edge, det_idx, prior_llr,
+                     max_iter, alpha, llr_out, v2c, c2v, par):
+    """synS[c, l]: syndrome of check c for shot (lane) l, stored as a sign: -1.0 if the
+    detector fired, +1.0 otherwise.  llr_out[v, l]: posterior LLR.
+    v2c, c2v: (n_edge, W) scratch; par: (n_chk, W) scratch.
+    Everything inside the lane loops is float64 so that they map to plain SIMD code."""
     n_chk = len(chk_ptr) - 1
     n_var = len(prior_llr)
     n_edge = len(chk_var)
-    v2c = np.empty(n_edge)
-    c2v = np.zeros(n_edge)
+    sg = np.empty(W)
+    m1 = np.empty(W)
+    m2 = np.empty(W)
+    tot = np.empty(W)
+    done = np.zeros(W)                 # 1.0 = lane already converged: its llr_out is frozen
     for e in range(n_edge):
-        v2c[e] = prior_llr[chk_var[e]]
-    hard = np.zeros(n_var, np.uint8)
+        p = prior_llr[chk_var[e]]
+        for l in range(W):
+            v2c[e, l] = p
     for v in range(n_var):
-        llr_out[v] = prior_llr[v]
+        for l in range(W):
+            llr_out[v, l] = prior_llr[v]
     for it in range(max_iter):
         # check -> variable
         for c in range(n_chk):
-            sgn = -1.0 if syn[c] else 1.0
-            min1 = 1e300
-            min2 = 1e300
-            arg = -1
-            for e in range(chk_ptr[c], chk_ptr[c + 1]):
-                m = v2c[e]
-                if m < 0:
-                    sgn = -sgn
-                a = abs(m)
-                if a < min1:
-                    min2 = min1
-                    min1 = a
-                    arg = e
-                elif a < min2:
-                    min2 = a
-            for e in range(chk_ptr[c], chk_ptr[c + 1]):
-                m = v2c[e]
-                s = sgn * (-1.0 if m < 0 else 1.0)
-                mag = min2 if e == arg else min1
-                c2v[e] = alpha * s * mag
-        # variable -> check and posterior
-        for v in range(n_var):
-            tot = prior_llr[v]
-            for k in range(var_ptr[v], var_ptr[v + 1]):
-                tot += c2v[var_edge[k]]
-            llr_out[v] = tot
-            hard[v] = 1 if tot < 0 else 0
-            for k in range(var_ptr[v], var_ptr[v + 1]):
-                e = var_edge[k]
-                v2c[e] = tot - c2v[e]
-        # syndrome check
-        ok = True
+            lo = chk_ptr[c]
+            hi = chk_ptr[c + 1]
+            for l in range(W):
+                sg[l] = synS[c, l]
+                m1[l] = 1e300
+                m2[l] = 1e300
+            for e in range(lo, hi):
+                for l in range(W):
+                    m = v2c[e, l]
+                    a = abs(m)
+                    sg[l] = -sg[l] if m < 0 else sg[l]
+                    # keep the two smallest magnitudes (same as the if/elif of the scalar code)
+                    m2[l] = min(m2[l], max(a, m1[l]))
+                    m1[l] = min(m1[l], a)
+            for e in range(lo, hi):
+                for l in range(W):
+                    m = v2c[e, l]
+                    s = -sg[l] if m < 0 else sg[l]
+                    # the edge holding the minimum gets the second minimum (if two edges tie
+                    # for the minimum then m2 == m1, so this matches the scalar code)
+                    mag = m2[l] if abs(m) == m1[l] else m1[l]
+                    c2v[e, l] = alpha * s * mag
+        # variable -> check, posterior, and parity of the hard decision on every check
+        # (par starts at the syndrome sign and is negated by every variable decided "1":
+        # the syndrome is satisfied when all par are +1)
         for c in range(n_chk):
-            par = 0
-            for e in range(chk_ptr[c], chk_ptr[c + 1]):
-                par ^= hard[chk_var[e]]
-            if par != syn[c]:
-                ok = False
-                break
-        if ok:
-            return True
-    return False
-
-
-# ----------------------------------------------------------------------------------------
-# 3. Ordered statistics decoding over GF(2), columns packed as 2 x uint64
-# ----------------------------------------------------------------------------------------
-
-
-@njit(cache=True)
-def _bit(w0, w1, b):
-    """Bit b of the 128-bit word (w0, w1)."""
-    if b < 64:
-        return (w0 >> np.uint64(b)) & np.uint64(1)
-    return (w1 >> np.uint64(b - 64)) & np.uint64(1)
-
-
-@njit(cache=True)
-def osd_classes(syn_w0, syn_w1, order, H_cols, L_cols, rank_cost, prob_cost, sweep, sweep2, aggregate):
-    """Ordered statistics decoding with a combination sweep.
-
-    order:     mechanisms sorted from most to least likely to have fired (by rank_cost).
-    rank_cost: posterior LLR from BP (lower = likelier); picks the best single solution.
-    prob_cost: prior LLR; -sum(prob_cost) over an error is its log-probability (up to a
-               constant), used to weigh solutions when aggregate is True.
-    sweep:     number of non-basis mechanisms tried one at a time on top of OSD-0.
-    sweep2:    the first sweep2 of those are also tried in pairs.
-
-    Returns a score for each of the 16 logical classes (values of the 4 observables):
-    if aggregate, log of the summed probability of all solutions found in that class;
-    otherwise 0 for the class of the lowest-cost solution and -inf for the others.
-    """
-    n = len(order)
-    # --- Gaussian elimination: first linearly independent columns in `order` form the basis
-    piv_w = np.zeros((128, 2), np.uint64)   # reduced basis vectors
-    piv_lo = np.zeros(128, np.int64)        # pivot (lowest set bit) of each basis vector
-    comb = np.zeros((128, 2), np.uint64)    # which basis columns XOR to this vector
-    basis = np.zeros(128, np.int64)         # mechanism index of each basis column
-    rank = 0
-    nonbasis = np.empty(max(sweep, 1), np.int64)
-    n_nb = 0
-    for idx in range(n):
-        j = order[idx]
-        w0, w1 = H_cols[j, 0], H_cols[j, 1]
-        c0 = np.uint64(0)
-        c1 = np.uint64(0)
-        if rank < 64:
-            c0 = np.uint64(1) << np.uint64(rank)
-        else:
-            c1 = np.uint64(1) << np.uint64(rank - 64)
-        for b in range(rank):
-            if _bit(w0, w1, piv_lo[b]):
-                w0 ^= piv_w[b, 0]
-                w1 ^= piv_w[b, 1]
-                c0 ^= comb[b, 0]
-                c1 ^= comb[b, 1]
-        if w0 == 0 and w1 == 0:            # dependent on the basis: candidate for the sweep
-            if n_nb < sweep:
-                nonbasis[n_nb] = j
-                n_nb += 1
-            continue
-        lo = 0
-        while not _bit(w0, w1, lo):
-            lo += 1
-        piv_w[rank, 0] = w0
-        piv_w[rank, 1] = w1
-        piv_lo[rank] = lo
-        comb[rank, 0] = c0
-        comb[rank, 1] = c1
-        basis[rank] = j
-        rank += 1
-        if n_nb >= sweep and rank >= 70:
+            for l in range(W):
+                par[c, l] = synS[c, l]
+        for v in range(n_var):
+            lo = var_ptr[v]
+            hi = var_ptr[v + 1]
+            for l in range(W):
+                tot[l] = prior_llr[v]
+            for k in range(lo, hi):
+                e = var_edge[k]
+                for l in range(W):
+                    tot[l] += c2v[e, l]
+            for l in range(W):
+                llr_out[v, l] = llr_out[v, l] if done[l] != 0.0 else tot[l]
+            for k in range(lo, hi):
+                e = var_edge[k]
+                c = det_idx[k]
+                for l in range(W):
+                    v2c[e, l] = tot[l] - c2v[e, l]
+                    par[c, l] = -par[c, l] if tot[l] < 0 else par[c, l]
+        # a lane whose hard decision satisfies its syndrome stops updating (early exit)
+        n_done = 0
+        for l in range(W):
+            if done[l] == 0.0:
+                ok = True
+                for c in range(n_chk):
+                    if par[c, l] < 0:
+                        ok = False
+                        break
+                if ok:
+                    done[l] = 1.0
+            if done[l] != 0.0:
+                n_done += 1
+        if n_done == W:
             break
 
-    scores = np.full(16, -np.inf)
-    best_cost = np.inf
-    n_pairs = sweep2 * (sweep2 - 1) // 2 if sweep2 <= n_nb else n_nb * (n_nb - 1) // 2
+
+# ----------------------------------------------------------------------------------------
+# 3. Ordered statistics decoding over GF(2)
+# ----------------------------------------------------------------------------------------
+# Bit vectors over the detectors (<= 128 of them) are stored as two uint64 words.
+#
+# Trick to list the set bits of a word quickly ("de Bruijn" bit scan): `x & -x` isolates
+# the lowest set bit 2^i; multiplying by the constant below and keeping the top 6 bits
+# gives a different number for each i, which a 64-entry table turns back into i.
+
+_DEBRUIJN = 0x03F79D71B4CB0A89
+BIT_INDEX = np.zeros(64, np.int64)
+for _i in range(64):
+    BIT_INDEX[((_DEBRUIJN << _i) & 0xFFFFFFFFFFFFFFFF) >> 58] = _i
+assert sorted(BIT_INDEX.tolist()) == list(range(64))
+
+DB = np.uint64(_DEBRUIJN)
+ONE = np.uint64(1)
+ZERO = np.uint64(0)
+S58 = np.uint64(58)
+
+
+@njit(cache=True)
+def osd_classes(syn, order, n_order, det_ptr, det_idx, L_cols, rank_cost, prob_cost,
+                sweep, sweep2, aggregate, full_rank, bit_index,
+                Rc, row_rank, b_cost, b_obs, nb_mech, nb_sol, nb_cost, nb_obs, scores):
+    """Ordered statistics decoding with a combination sweep.
+
+    order[:n_order]: mechanisms sorted from most to least likely to have fired.
+    rank_cost: posterior LLR from BP; prob_cost: prior LLR (-sum over an error = its
+               log-probability up to a constant).
+    sweep:     number of non-basis mechanisms tried one at a time on top of OSD-0.
+    sweep2:    the first sweep2 of those are also tried in pairs.
+    full_rank: rank of H (capped at 70): the basis is complete when it reaches this size.
+
+    Fills scores[16], one per logical class (value of the 4 observables): if aggregate,
+    log of the summed probability of all solutions found in that class; otherwise 0 for
+    the class of the lowest-cost solution and -inf for the others.
+
+    Returns False if order[:n_order] ran out before the basis and the sweep list were
+    complete (the caller then retries with a longer list); True otherwise.
+
+    How it works.  We keep a matrix R (stored column by column in Rc) such that
+    R * (basis column number b) = unit vector on "pivot row" of b.  Then for ANY vector
+    y in the span of the basis, R*y directly reads which basis columns XOR to y.  So
+      * R*h_j for a new column j tells at once whether j is independent (a bit outside
+        the pivot rows) and, if not, its expansion on the basis;
+      * the OSD-0 solution is R*syndrome;
+      * flipping non-basis mechanisms a (and b) changes the basis part of the solution
+        to  R*syn ^ R*h_a (^ R*h_b): one or two XORs per trial instead of a new solve.
+    """
+    n_det = len(syn)
+    # --- R = identity
+    for d in range(n_det):
+        if d < 64:
+            Rc[d, 0] = ONE << np.uint64(d)
+            Rc[d, 1] = ZERO
+        else:
+            Rc[d, 0] = ZERO
+            Rc[d, 1] = ONE << np.uint64(d - 64)
+    piv0 = ZERO                 # set of pivot rows (two words)
+    piv1 = ZERO
+    rank = 0
+    n_nb = 0
+    complete = False
+    cost = prob_cost if aggregate else rank_cost
+    # --- Gaussian elimination: first linearly independent columns in `order` form the basis
+    for idx in range(n_order):
+        j = order[idx]
+        v0 = ZERO               # v = R * h_j  (XOR of the columns of R at the detectors of j)
+        v1 = ZERO
+        for k in range(det_ptr[j], det_ptr[j + 1]):
+            d = det_idx[k]
+            v0 ^= Rc[d, 0]
+            v1 ^= Rc[d, 1]
+        f0 = v0 & ~piv0         # part of v outside the pivot rows
+        f1 = v1 & ~piv1
+        if f0 == ZERO and f1 == ZERO:
+            # dependent on the basis: candidate for the sweep; v is its basis expansion
+            if n_nb < sweep:
+                nb_mech[n_nb] = j
+                nb_sol[n_nb, 0] = v0
+                nb_sol[n_nb, 1] = v1
+                n_nb += 1
+        else:
+            # independent: new basis column. Pick a new pivot row and update R with row
+            # operations so that R * h_j becomes the unit vector on that row.
+            if f0 != ZERO:
+                low = f0 & (~f0 + ONE)
+                row = bit_index[(low * DB) >> S58]
+                piv0 |= low
+                u0 = v0 ^ low
+                u1 = v1
+                for d in range(n_det):
+                    if Rc[d, 0] & low:
+                        Rc[d, 0] ^= u0
+                        Rc[d, 1] ^= u1
+            else:
+                low = f1 & (~f1 + ONE)
+                row = 64 + bit_index[(low * DB) >> S58]
+                piv1 |= low
+                u0 = v0
+                u1 = v1 ^ low
+                for d in range(n_det):
+                    if Rc[d, 1] & low:
+                        Rc[d, 0] ^= u0
+                        Rc[d, 1] ^= u1
+            row_rank[row] = rank
+            b_cost[rank] = cost[j]
+            b_obs[rank] = L_cols[j, 0]
+            rank += 1
+        if n_nb >= sweep and rank >= full_rank:
+            complete = True
+            break
+    if not complete and n_order < len(cost):
+        return False            # ran out of sorted mechanisms: caller must give more
+
+    for k in range(16):
+        scores[k] = -np.inf
+
+    # --- OSD-0 solution = R * syndrome
+    s0 = ZERO
+    s1 = ZERO
+    for d in range(n_det):
+        if syn[d]:
+            s0 ^= Rc[d, 0]
+            s1 ^= Rc[d, 1]
+    if (s0 & ~piv0) != ZERO or (s1 & ~piv1) != ZERO:
+        return True             # syndrome not reachable (does not happen for a valid one)
+
+    # --- Re-index every solution from "pivot row" to "position in the basis" (bit b <->
+    # b-th basis column, b-th most likely first) and compute its observable flips.
+    # Slot n_nb holds the OSD-0 solution, slots 0..n_nb-1 the sweep candidates.
+    nb_sol[n_nb, 0] = s0
+    nb_sol[n_nb, 1] = s1
+    for i in range(n_nb + 1):
+        q0 = ZERO
+        q1 = ZERO
+        obs = ZERO
+        for w in range(2):
+            x = nb_sol[i, w]
+            while x != ZERO:
+                low = x & (~x + ONE)
+                x ^= low
+                b = row_rank[64 * w + bit_index[(low * DB) >> S58]]
+                obs ^= b_obs[b]
+                if b < 64:
+                    q0 |= ONE << np.uint64(b)
+                else:
+                    q1 |= ONE << np.uint64(b - 64)
+        nb_sol[i, 0] = q0
+        nb_sol[i, 1] = q1
+        if i < n_nb:
+            j = nb_mech[i]
+            nb_cost[i] = cost[j]
+            obs ^= L_cols[j, 0]
+        nb_obs[i] = obs
+    s0 = nb_sol[n_nb, 0]
+    s1 = nb_sol[n_nb, 1]
+    s_obs = nb_obs[n_nb]
+
+    # --- Trials: OSD-0, then every single sweep candidate, then pairs among the first m2
     m2 = min(sweep2, n_nb)
-    total = 1 + n_nb + n_pairs
-    for trial in range(total):
-        # which extra (non-basis) mechanisms are flipped in this trial
-        e1 = -1
-        e2 = -1
-        if trial >= 1 and trial <= n_nb:
-            e1 = nonbasis[trial - 1]
-        elif trial > n_nb:
-            t = trial - 1 - n_nb
-            a = 0
-            while t >= m2 - 1 - a:
-                t -= m2 - 1 - a
-                a += 1
-            e1 = nonbasis[a]
-            e2 = nonbasis[a + 1 + t]
-        s0, s1 = syn_w0, syn_w1
-        rc = 0.0
-        pc = 0.0
-        obs = np.uint64(0)
-        if e1 >= 0:
-            s0 ^= H_cols[e1, 0]
-            s1 ^= H_cols[e1, 1]
-            rc += rank_cost[e1]
-            pc += prob_cost[e1]
-            obs ^= L_cols[e1, 0]
-        if e2 >= 0:
-            s0 ^= H_cols[e2, 0]
-            s1 ^= H_cols[e2, 1]
-            rc += rank_cost[e2]
-            pc += prob_cost[e2]
-            obs ^= L_cols[e2, 0]
-        # solve H_basis x = remaining syndrome
-        r0 = np.uint64(0)
-        r1 = np.uint64(0)
-        for b in range(rank):
-            if _bit(s0, s1, piv_lo[b]):
-                s0 ^= piv_w[b, 0]
-                s1 ^= piv_w[b, 1]
-                r0 ^= comb[b, 0]
-                r1 ^= comb[b, 1]
-        if s0 != 0 or s1 != 0:
-            continue  # syndrome not reachable (does not happen for a valid syndrome)
-        for b in range(rank):
-            if _bit(r0, r1, b):
-                j = basis[b]
-                rc += rank_cost[j]
-                pc += prob_cost[j]
-                obs ^= L_cols[j, 0]
-        k = int(obs)
-        if aggregate:
-            lp = -pc
-            hi = max(scores[k], lp)
-            scores[k] = hi + np.log(np.exp(scores[k] - hi) + np.exp(lp - hi))
-        elif rc < best_cost:
-            best_cost = rc
-            scores[:] = -np.inf
-            scores[k] = 0.0
-    return scores
+    best_cost = np.inf
+    best_k = -1
+    a = -1                      # a = -1: OSD-0 and singles; a >= 0: pairs (a, i), i > a
+    while a < m2:
+        if a < 0:
+            a0 = s0
+            a1 = s1
+            a_obs = s_obs
+            a_cost = 0.0
+            first = -1          # i = -1 stands for "no flip" (OSD-0 itself)
+            last = n_nb
+        else:
+            a0 = s0 ^ nb_sol[a, 0]
+            a1 = s1 ^ nb_sol[a, 1]
+            a_obs = s_obs ^ nb_obs[a]
+            a_cost = 0.0 + nb_cost[a]
+            first = a + 1
+            last = m2
+        for i in range(first, last):
+            if i < 0:
+                r0 = a0
+                r1 = a1
+                k = np.int64(a_obs)
+                c = a_cost
+            else:
+                r0 = a0 ^ nb_sol[i, 0]
+                r1 = a1 ^ nb_sol[i, 1]
+                k = np.int64(a_obs ^ nb_obs[i])
+                c = a_cost + nb_cost[i]
+            # add the cost of the basis mechanisms of this solution, most likely first
+            # (same summation order as the reference implementation -> same rounding)
+            while r0 != ZERO:
+                low = r0 & (~r0 + ONE)
+                r0 ^= low
+                c += b_cost[bit_index[(low * DB) >> S58]]
+            while r1 != ZERO:
+                low = r1 & (~r1 + ONE)
+                r1 ^= low
+                c += b_cost[64 + bit_index[(low * DB) >> S58]]
+            if aggregate:
+                # scores[k] = log(exp(scores[k]) + exp(-c)), written as
+                # max + log(1 + exp(-|difference|)).
+                lp = -c
+                sk = scores[k]
+                if lp > sk:
+                    diff = lp - sk
+                    sk = lp
+                else:
+                    diff = sk - lp
+                if diff < 40.0:     # beyond that 1 + exp(-diff) == 1 exactly in float64
+                    sk += np.log(1.0 + np.exp(-diff))
+                scores[k] = sk
+            elif c < best_cost:
+                best_cost = c
+                best_k = k
+        a += 1
+    if not aggregate and best_k >= 0:
+        scores[best_k] = 0.0
+    return True
 
 
 # ----------------------------------------------------------------------------------------
 # 4. Batch decoding, parallel over shots
 # ----------------------------------------------------------------------------------------
 
+CHUNK = 128         # shots handled by one task; scratch buffers are allocated once per task
+
 
 @njit(parallel=True, cache=True)
-def decode_batch(dets, chk_ptr, chk_var, var_ptr, var_edge, prior_llr, H_cols, L_cols,
-                 max_iter, alpha, sweep, sweep2, aggregate):
+def decode_batch(dets, chk_ptr, chk_var, var_ptr, var_edge, prior_llr, det_ptr, det_idx,
+                 L_cols, full_rank, bit_index, max_iter, alpha, sweep, sweep2, aggregate,
+                 presort):
+    """presort: how many of the most likely mechanisms are sorted first (OSD rarely needs
+    more; when it does, that shot falls back to a full sort, so the result never changes)."""
     shots, n_det = dets.shape
     n_var = len(prior_llr)
+    n_edge = len(chk_var)
     out = np.zeros((shots, 4), np.uint8)
-    for s in prange(shots):
-        syn = dets[s]
-        w = 0
-        for d in range(n_det):
-            w += syn[d]
-        if w == 0:
-            continue                    # no detector fired: predict no logical flip
+    n_chunks = (shots + CHUNK - 1) // CHUNK
+    for ch in prange(n_chunks):
+        # scratch buffers of this task
+        todo = np.empty(CHUNK, np.int64)
+        synS = np.empty((n_det, W))
+        llrW = np.empty((n_var, W))
+        v2c = np.empty((n_edge, W))
+        c2v = np.empty((n_edge, W))
+        par = np.empty((n_det, W))
         llr = np.empty(n_var)
-        bp_min_sum(syn, chk_ptr, chk_var, var_ptr, var_edge, prior_llr, max_iter, alpha, llr)
-        s0 = np.uint64(0)
-        s1 = np.uint64(0)
-        for d in range(n_det):
-            if syn[d]:
-                if d < 64:
-                    s0 |= np.uint64(1) << np.uint64(d)
-                else:
-                    s1 |= np.uint64(1) << np.uint64(d - 64)
-        order = np.argsort(llr, kind="mergesort")
-        scores = osd_classes(s0, s1, order, H_cols, L_cols, llr, prior_llr, sweep, sweep2, aggregate)
-        # each observable bit: compare total probability of classes with that bit 1 vs 0
-        mx = scores.max()
-        for k in range(4):
-            p1 = 0.0
-            p0 = 0.0
-            for c in range(16):
-                v = np.exp(scores[c] - mx)
-                if (c >> k) & 1:
-                    p1 += v
-                else:
-                    p0 += v
-            out[s, k] = 1 if p1 > p0 else 0
+        tmp = np.empty(n_var)
+        cand = np.empty(n_var, np.int64)
+        cand_llr = np.empty(n_var)
+        order = np.empty(n_var, np.int64)
+        Rc = np.empty((n_det, 2), np.uint64)
+        row_rank = np.empty(128, np.int64)
+        b_cost = np.empty(128)
+        b_obs = np.empty(128, np.uint64)
+        nb_mech = np.empty(sweep + 1, np.int64)
+        nb_sol = np.empty((sweep + 1, 2), np.uint64)
+        nb_cost = np.empty(sweep + 1)
+        nb_obs = np.empty(sweep + 1, np.uint64)
+        scores = np.empty(16)
+        w16 = np.empty(16)
+        # shots of this task with at least one detector fired (the others: predict no flip)
+        n_todo = 0
+        for s in range(ch * CHUNK, min(shots, (ch + 1) * CHUNK)):
+            w = 0
+            for d in range(n_det):
+                w += dets[s, d]
+            if w != 0:
+                todo[n_todo] = s
+                n_todo += 1
+        for g in range(0, n_todo, W):
+            n_lane = min(W, n_todo - g)
+            # --- BP on up to W shots at once (unused lanes get an all-zero syndrome)
+            for l in range(W):
+                for d in range(n_det):
+                    synS[d, l] = -1.0 if (l < n_lane and dets[todo[g + l], d]) else 1.0
+            bp_min_sum_lanes(synS, chk_ptr, chk_var, var_ptr, var_edge, det_idx, prior_llr,
+                             max_iter, alpha, llrW, v2c, c2v, par)
+            # --- OSD shot by shot
+            for l in range(n_lane):
+                s = todo[g + l]
+                syn = dets[s]
+                for v in range(n_var):
+                    llr[v] = llrW[v, l]
+                # sort only the `presort` most likely mechanisms (ties broken by index,
+                # exactly like a stable sort of everything would do)
+                done = False
+                if presort < n_var:
+                    tmp[:] = llr
+                    thr = np.partition(tmp, presort - 1)[presort - 1]   # presort-th smallest LLR
+                    m = 0
+                    for v in range(n_var):
+                        if llr[v] <= thr:
+                            cand[m] = v
+                            cand_llr[m] = llr[v]
+                            m += 1
+                    sub = np.argsort(cand_llr[:m], kind="mergesort")
+                    for i in range(m):
+                        order[i] = cand[sub[i]]
+                    done = osd_classes(syn, order, m, det_ptr, det_idx, L_cols, llr, prior_llr,
+                                       sweep, sweep2, aggregate, full_rank, bit_index,
+                                       Rc, row_rank, b_cost, b_obs, nb_mech, nb_sol, nb_cost,
+                                       nb_obs, scores)
+                if not done:                # rare: needs the full ordering
+                    full = np.argsort(llr, kind="mergesort")
+                    osd_classes(syn, full, n_var, det_ptr, det_idx, L_cols, llr, prior_llr,
+                                sweep, sweep2, aggregate, full_rank, bit_index,
+                                Rc, row_rank, b_cost, b_obs, nb_mech, nb_sol, nb_cost,
+                                nb_obs, scores)
+                # each observable bit: total probability of classes with that bit 1 vs 0
+                mx = scores[0]
+                for c in range(1, 16):
+                    if scores[c] > mx:
+                        mx = scores[c]
+                for c in range(16):
+                    w16[c] = np.exp(scores[c] - mx)
+                for k in range(4):
+                    p1 = 0.0
+                    p0 = 0.0
+                    for c in range(16):
+                        if (c >> k) & 1:
+                            p1 += w16[c]
+                        else:
+                            p0 += w16[c]
+                    out[s, k] = 1 if p1 > p0 else 0
     return out
 
 
@@ -323,6 +527,7 @@ ALPHA = 0.3
 SWEEP = 300
 SWEEP2 = 80
 AGGREGATE = True
+PRESORT = 512       # speed only: predictions do not depend on it (see decode_batch)
 
 
 def prepare(circuit: stim.Circuit):
@@ -339,7 +544,10 @@ def prepare(circuit: stim.Circuit):
     var_ptr = np.cumsum(var_ptr)
     var_edge = edge_order.astype(np.int64)
     prior_llr = np.log((1 - p) / p)
-    return (chk_ptr, chk_var, var_ptr, var_edge, prior_llr, pack_columns(H), pack_columns(L))
+    det_idx = rows[edge_order].astype(np.int64)       # detectors of each mechanism (CSR with var_ptr)
+    full_rank = min(70, gf2_rank(H))
+    return (chk_ptr, chk_var, var_ptr, var_edge, prior_llr, var_ptr, det_idx,
+            pack_columns(L), full_rank, BIT_INDEX)
 
 
 _cache = {}
@@ -356,7 +564,7 @@ def decode(circuit: stim.Circuit, detector_events: np.ndarray) -> np.ndarray:
         _cache[key] = prepare(circuit)
     args = _cache[key]
     dets = np.ascontiguousarray(detector_events, dtype=np.uint8)
-    return decode_batch(dets, *args, MAX_ITER, ALPHA, SWEEP, SWEEP2, AGGREGATE)
+    return decode_batch(dets, *args, MAX_ITER, ALPHA, SWEEP, SWEEP2, AGGREGATE, PRESORT)
 
 
 # Compile the numba kernels at import time (import is not timed).
@@ -365,7 +573,7 @@ def _warmup():
                                before_round_data_depolarization=0.01)
     args = prepare(c)
     dets = np.ones((2, c.num_detectors), np.uint8)
-    decode_batch(dets, *args, MAX_ITER, ALPHA, SWEEP, SWEEP2, AGGREGATE)
+    decode_batch(dets, *args, MAX_ITER, ALPHA, SWEEP, SWEEP2, AGGREGATE, PRESORT)
 
 
 _warmup()
