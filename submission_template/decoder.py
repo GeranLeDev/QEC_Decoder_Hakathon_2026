@@ -14,8 +14,12 @@ For group d each state must end with bit d explained:
 Children that reach the same state are merged (their weights add up: that is the sum over
 equivalent errors that makes this a maximum-likelihood rather than a min-weight decoder).
 After each group only the K best states are kept, ranked by
-      weight x LOOK^(number of syndrome bits still unexplained)
+      score = weight x LOOK^(number of syndrome bits still unexplained)
 (a state with more unexplained bits will need more errors later, so it is worth less).
+The SAME score decides which children are created at all: a child whose score is below
+CHILD x (best score of the current states) would be thrown away by the ranking anyway, so
+it is never put in the table.  This is what makes two-mechanism children affordable: only
+the pairs that really help (those that clear syndrome bits) are created.
 At the end all surviving states have an empty syndrome; summing weights per logical value
 gives the class probabilities, and each observable bit is predicted by its marginal.
 Fully deterministic.
@@ -187,8 +191,8 @@ def _max_group(grp_ptr):
 
 
 @njit(cache=True)
-def beam_one(s0, s1, m0, m1, odds, grp_ptr, K, thr1, thr2, keep, pow_look, max_group,
-             a0, a1, w, b0, b1, bw, sc, tmp, table, ctx, P):
+def beam_one(s0, s1, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, pow_look, max_group,
+             ps, a0, a1, w, b0, b1, bw, sc, tmp, table, ctx, P):
     """Fills P (16,) with the weights of the logical classes for one syndrome (s0, s1).
     The work arrays are passed in so that each thread allocates them only once.
     ctx = [last stamp used, number of table slots already zeroed] (see _new_table).
@@ -203,17 +207,25 @@ def beam_one(s0, s1, m0, m1, odds, grp_ptr, K, thr1, thr2, keep, pow_look, max_g
     for d in range(nD):
         g0 = grp_ptr[d]
         g1 = grp_ptr[d + 1]
-        wmax = 0.0
+        smax = 0.0                # best score among the current states
         n_set = 0                 # number of states whose bit d is set
         for i in range(n):
-            if w[i] > wmax:
-                wmax = w[i]
+            # score of the state = weight x LOOK^(unexplained bits)
+            ps[i] = w[i] * pow_look[_popcount(a0[i]) + _popcount(a1[i] & np.uint64(63))]
+            if ps[i] > smax:
+                smax = ps[i]
             if d < 64:
                 n_set += np.int64((a0[i] >> np.uint64(d)) & np.uint64(1))
             else:
                 n_set += np.int64((a1[i] >> np.uint64(d - 64)) & np.uint64(1))
-        cut1 = thr1 * wmax        # one-mechanism children lighter than this are not created
-        cut2 = thr2 * wmax        # same for two-mechanism children
+        # Two levels of cuts, all relative to the best score:
+        #  - cut1 / cut2: (score of the parent) x (odds of the fired mechanisms) below this
+        #    -> stop scanning the group (it is sorted by decreasing odds).  These are loose
+        #    bounds: a child can score higher than that if it clears syndrome bits.
+        #  - cutc: exact score of the child below this -> the child is not created.
+        cut1 = thr1 * smax
+        cut2 = thr2 * smax
+        cutc = child * smax
         # fresh (empty) table for this detector, sized for the expected number of children:
         # one per state, plus the whole group for the states whose bit is set (pairs are
         # rare; if the guess is too small the table simply grows below)
@@ -233,6 +245,7 @@ def beam_one(s0, s1, m0, m1, odds, grp_ptr, K, thr1, thr2, keep, pow_look, max_g
             x0 = a0[i]
             x1 = a1[i]
             wi = w[i]
+            si = ps[i]
             if d < 64:
                 bit = (x0 >> np.uint64(d)) & np.uint64(1)
             else:
@@ -243,8 +256,8 @@ def beam_one(s0, s1, m0, m1, odds, grp_ptr, K, thr1, thr2, keep, pow_look, max_g
                 # ... or two mechanisms fire (rare; the group is sorted by decreasing
                 # odds, so we can stop as soon as the product gets too small)
                 for j in range(g0, g1 - 1):
-                    wj = wi * odds[j]
-                    if wj * odds[j + 1] < cut2:
+                    sj = si * odds[j]
+                    if sj * odds[j + 1] < cut2:
                         break
                     if 2 * (m + max_group) > size and size < tsize:
                         size = _room(m, max_group, size, tsize)
@@ -254,17 +267,26 @@ def beam_one(s0, s1, m0, m1, odds, grp_ptr, K, thr1, thr2, keep, pow_look, max_g
                     y0 = x0 ^ m0[j]
                     y1 = x1 ^ m1[j]
                     for k in range(j + 1, g1):
-                        wk = wj * odds[k]
-                        if wk < cut2:
+                        if sj * odds[k] < cut2:
                             break
-                        m = _add(y0 ^ m0[k], y1 ^ m1[k], wk, b0, b1, bw, m, table, cur, mask)
+                        z0 = y0 ^ m0[k]
+                        z1 = y1 ^ m1[k]
+                        wk = wi * odds[j] * odds[k]
+                        # exact score of this child; skip it if the ranking would drop it
+                        if wk * pow_look[_popcount(z0) + _popcount(z1 & np.uint64(63))] < cutc:
+                            continue
+                        m = _add(z0, z1, wk, b0, b1, bw, m, table, cur, mask)
             else:
                 # exactly one mechanism of the group fires
                 for j in range(g0, g1):
-                    wj = wi * odds[j]
-                    if wj < cut1:
+                    if si * odds[j] < cut1:
                         break
-                    m = _add(x0 ^ m0[j], x1 ^ m1[j], wj, b0, b1, bw, m, table, cur, mask)
+                    wj = wi * odds[j]
+                    z0 = x0 ^ m0[j]
+                    z1 = x1 ^ m1[j]
+                    if wj * pow_look[_popcount(z0) + _popcount(z1 & np.uint64(63))] < cutc:
+                        continue
+                    m = _add(z0, z1, wj, b0, b1, bw, m, table, cur, mask)
         work += m
         if m >= len(bw):
             work += 1000000000   # table full (never happens with sane settings): flag it
@@ -313,7 +335,7 @@ def beam_one(s0, s1, m0, m1, odds, grp_ptr, K, thr1, thr2, keep, pow_look, max_g
 
 
 @njit(parallel=True, cache=True)
-def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, keep, look, cap_mult):
+def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, look, cap_mult):
     """Decode all shots (parallel over shots). Returns predictions (shots, 4) and the
     work done per shot (diagnostic only)."""
     shots, nD = dets.shape
@@ -356,6 +378,7 @@ def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, keep, look, cap_mul
         # np.empty costs nothing until the memory is really used: only the beginning of
         # these (generously sized) arrays is ever touched.
         a0 = np.empty(K, np.uint64); a1 = np.empty(K, np.uint64); w = np.empty(K)
+        ps = np.empty(K)                # scores of the current states
         b0 = np.empty(cap, np.uint64); b1 = np.empty(cap, np.uint64); bw = np.empty(cap)
         sc = np.empty(cap); tmp = np.empty(cap)
         table = np.empty(tsize, np.int64)
@@ -373,8 +396,8 @@ def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, keep, look, cap_mul
                         s1 |= np.uint64(1) << np.uint64(d - 64)
             if s0 == 0 and s1 == 0:
                 continue                # no detector fired: predict no logical flip
-            work[s] = beam_one(s0, s1, m0, m1, odds, grp_ptr, K, thr1, thr2, keep, pow_look,
-                               max_group, a0, a1, w, b0, b1, bw, sc, tmp, table, ctx, P)
+            work[s] = beam_one(s0, s1, m0, m1, odds, grp_ptr, K, thr1, thr2, child, keep, pow_look,
+                               max_group, ps, a0, a1, w, b0, b1, bw, sc, tmp, table, ctx, P)
             tot = 0.0
             for c in range(16):
                 tot += P[c]
@@ -391,8 +414,9 @@ def decode_batch(dets, m0, m1, odds, grp_ptr, K, thr1, thr2, keep, look, cap_mul
 # Public entry point
 # ----------------------------------------------------------------------------------------
 K_BEAM = 1000      # at most this many states kept after each detector
-THR1 = 1e-8       # one-mechanism children lighter than THR1 x (heaviest state) are not created
-THR2 = 3e-7       # same for children made by two mechanisms of the same group
+THR1 = 1e-9       # stop scanning a group when parent score x odds < THR1 x best score
+THR2 = 1e-8       # same with the product of the odds of two mechanisms of the group
+CHILD = 3e-6      # a child scoring below CHILD x (best score) is not created
 KEEP = 1e-6        # states scoring below KEEP x (best score) are dropped
 LOOK = 0.15        # look-ahead penalty per unexplained syndrome bit
 CAP_MULT = 256    # work-table size = K_BEAM x CAP_MULT
@@ -407,13 +431,13 @@ def decode(circuit: stim.Circuit, detector_events: np.ndarray) -> np.ndarray:
     if key not in _cache:
         _cache[key] = prepare(circuit)
     dets = np.ascontiguousarray(detector_events, dtype=np.uint8)
-    return decode_batch(dets, *_cache[key], K_BEAM, THR1, THR2, KEEP, LOOK, CAP_MULT)[0]
+    return decode_batch(dets, *_cache[key], K_BEAM, THR1, THR2, CHILD, KEEP, LOOK, CAP_MULT)[0]
 
 
 def _warmup():
     c = stim.Circuit.generated("repetition_code:memory", rounds=2, distance=3,
                                before_round_data_depolarization=0.01)
-    decode_batch(np.ones((2, c.num_detectors), np.uint8), *prepare(c), 8, THR1, THR2, KEEP, LOOK, CAP_MULT)
+    decode_batch(np.ones((2, c.num_detectors), np.uint8), *prepare(c), 8, THR1, THR2, CHILD, KEEP, LOOK, CAP_MULT)
 
 
 _warmup()
